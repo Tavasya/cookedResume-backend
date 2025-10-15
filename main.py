@@ -14,10 +14,18 @@ load_dotenv()
 
 app = FastAPI(title="CookedResume API", description="Where dreams go to die")
 
-# CORS middleware
+# CORS middleware - allow both local and production frontend
+allowed_origins = [
+    "http://localhost:8080",
+    "http://localhost:3000",
+    "http://localhost:5173",  # Vite default
+    "https://cookedresume.com",
+    "https://www.cookedresume.com"
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
