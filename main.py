@@ -9,6 +9,9 @@ from io import BytesIO
 import stripe
 from pydantic import BaseModel
 from clerk_backend_api import Clerk
+import json
+from datetime import datetime
+from pathlib import Path
 
 load_dotenv()
 
@@ -43,6 +46,46 @@ clerk_client = Clerk(bearer_auth=os.getenv("CLERK_SECRET_KEY"))
 
 # Pricing (in cents)
 ROAST_PRICE = 100  # $1.00 per roast
+
+# Analytics file path
+UPLOADS_LOG_FILE = Path(__file__).parent / "resume_uploads.json"
+
+
+def log_resume_upload(filename: str, file_size: int, success: bool = True, error: str = None):
+    """
+    Log resume upload event to JSON file for analytics.
+
+    Args:
+        filename: Name of the uploaded file
+        file_size: Size of the file in bytes
+        success: Whether the upload was successful
+        error: Error message if upload failed
+    """
+    upload_data = {
+        "timestamp": datetime.utcnow().isoformat(),
+        "filename": filename,
+        "file_size_bytes": file_size,
+        "success": success,
+        "error": error
+    }
+
+    try:
+        # Read existing data or create new list
+        if UPLOADS_LOG_FILE.exists():
+            with open(UPLOADS_LOG_FILE, 'r') as f:
+                uploads = json.load(f)
+        else:
+            uploads = []
+
+        # Append new upload
+        uploads.append(upload_data)
+
+        # Write back to file
+        with open(UPLOADS_LOG_FILE, 'w') as f:
+            json.dump(uploads, f, indent=2)
+    except Exception as e:
+        # Don't fail the request if logging fails
+        print(f"Failed to log upload: {str(e)}")
 
 
 def extract_text_from_pdf(pdf_file: bytes) -> str:
@@ -186,32 +229,45 @@ async def roast_resume_endpoint(file: UploadFile = File(...)):
     # Read file
     try:
         pdf_content = await file.read()
+        file_size = len(pdf_content)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to read file: {str(e)}")
 
     # Extract text from PDF
-    resume_text = extract_text_from_pdf(pdf_content)
+    try:
+        resume_text = extract_text_from_pdf(pdf_content)
 
-    if not resume_text or len(resume_text.strip()) < 50:
-        raise HTTPException(
-            status_code=400,
-            detail="Your resume is either empty or so bad that we can't even read it. Impressive failure."
-        )
+        if not resume_text or len(resume_text.strip()) < 50:
+            log_resume_upload(file.filename, file_size, success=False, error="Empty or unreadable PDF")
+            raise HTTPException(
+                status_code=400,
+                detail="Your resume is either empty or so bad that we can't even read it. Impressive failure."
+            )
 
-    # Parse resume into sections
-    resume_sections = parse_resume_sections(resume_text)
+        # Parse resume into sections
+        resume_sections = parse_resume_sections(resume_text)
 
-    # Get the roast from ChatGPT
-    roast = roast_resume(resume_text)
+        # Get the roast from ChatGPT
+        roast = roast_resume(resume_text)
 
-    return JSONResponse(content={
-        "status": "cooked",
-        "filename": file.filename,
-        "resume_text": resume_text,
-        "resume_sections": resume_sections,
-        "roast": roast,
-        "message": "Your resume has been thoroughly destroyed. You're welcome."
-    })
+        # Log successful upload
+        log_resume_upload(file.filename, file_size, success=True)
+
+        return JSONResponse(content={
+            "status": "cooked",
+            "filename": file.filename,
+            "resume_text": resume_text,
+            "resume_sections": resume_sections,
+            "roast": roast,
+            "message": "Your resume has been thoroughly destroyed. You're welcome."
+        })
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
+    except Exception as e:
+        # Log failed upload
+        log_resume_upload(file.filename, file_size, success=False, error=str(e))
+        raise HTTPException(status_code=500, detail=f"Error processing resume: {str(e)}")
 
 
 @app.post("/create-checkout-session")
@@ -409,6 +465,44 @@ async def stripe_webhook(request: Request):
 @app.get("/health")
 def health_check():
     return {"status": "alive and roasting"}
+
+
+@app.get("/analytics/uploads")
+def get_upload_analytics():
+    """
+    Get analytics about resume uploads.
+    Returns total count, success/failure breakdown, and recent uploads.
+    """
+    try:
+        if not UPLOADS_LOG_FILE.exists():
+            return JSONResponse(content={
+                "total_uploads": 0,
+                "successful_uploads": 0,
+                "failed_uploads": 0,
+                "recent_uploads": []
+            })
+
+        with open(UPLOADS_LOG_FILE, 'r') as f:
+            uploads = json.load(f)
+
+        total = len(uploads)
+        successful = sum(1 for u in uploads if u.get("success", False))
+        failed = total - successful
+
+        # Get last 10 uploads
+        recent = uploads[-10:] if len(uploads) > 10 else uploads
+        recent.reverse()  # Most recent first
+
+        return JSONResponse(content={
+            "total_uploads": total,
+            "successful_uploads": successful,
+            "failed_uploads": failed,
+            "success_rate": f"{(successful/total*100):.1f}%" if total > 0 else "0%",
+            "recent_uploads": recent
+        })
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error reading analytics: {str(e)}")
 
 
 if __name__ == "__main__":
